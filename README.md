@@ -23,6 +23,7 @@ facc = data[:, 3].reshape((21, 21, 21))
 Here is a simple python function for the analytic form of $f_{\rm acc}$ described in the appendix of our first paper. The inputs may be scalars or arrays with commensurate shapes.
 
 ```python
+import numpy as np
 def facc(tau, lum, beta):
     tau, lum, beta = np.asarray(tau), np.asarray(lum), np.asarray(beta)
     tau, lum, beta = np.broadcast_arrays(tau, lum, beta)
