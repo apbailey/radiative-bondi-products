@@ -12,11 +12,14 @@ compute_luminosity_facc_from_cgs  -- self-consistent (L, f_acc) via bisection
 
 Private Functions
 -----------------
-_compute_facc_from_dimensionless  -- f_acc from (tau, L, beta)
+_compute_facc_from_dimensionless             -- f_acc from (tau, L, beta)
+_compute_luminosity_facc_from_dimensionless  -- L, f_acc from (tau, L_acc, beta, L_other)
 _analytic_facc                    -- f_acc from (tau, L, beta), analytic formula
 _tabulated_facc                   -- f_acc from (tau, L, beta), tabulated solutions
 
 _sound_speed                      -- compute c_s from other CGS quantities
+_bondi_radius                     -- compute Bondi radius from CGS quantities
+_luminosity_scale                 -- compute luminosity scale l0 from CGS quantities
 _beta                             -- compute beta from CGS quantities
 _cgs_to_dimensionless             -- convert CGS to (tau, L,  beta)
 _adiabatic_mdot                   -- compute adiabatic Bondi rate from CGS quantities
@@ -24,9 +27,9 @@ _adiabatic_mdot                   -- compute adiabatic Bondi rate from CGS quant
 _luminosity_bracket               -- estimate brackets for root-finding L
 _vectorized_bisect                -- bisection root-finder
 
-_load_table()                     -- load tabulated facc.tab
+_load_table                       -- load tabulated facc.tab
 _construct_table_interpolator     -- create interpolator for table in logspace
-_construct_lmin_interpolator      -- create interpolater for lmin(tau, beta)
+_construct_lmin_interpolator      -- create interpolator for lmin(tau, beta)
 
 _broadcast_float                  -- broadcast inputs and make floats
 _validate_choice                  -- check optional inputs are valid
@@ -118,8 +121,12 @@ def compute_facc_from_cgs(
     opacity : float or array-like
         Disk opacity [cm^2 g^-1].  Use the Rosseland mean for optically thick
         conditions or the Planck mean for optically thin conditions.
-    mode, interpolation, extrapolate
-        Forwarded to `_compute_facc_from_dimensionless`; see its docstring.
+    mode : {"mixed", "analytic", "tabulated"}, optional
+        Computation method for f_acc.  Default "mixed".
+    interpolation : {"linear", "nearest"}, optional
+        Interpolation scheme for tabulated/mixed modes.  Default "linear".
+    extrapolate : bool, optional
+        Whether to extrapolate outside the tabulated domain.  Default False.
 
     Returns
     -------
@@ -161,6 +168,9 @@ def compute_luminosity_facc_from_cgs(
     """
     Compute f_acc and the self-consistent total luminosity L = L_acc + L_other
     from physical CGS parameters.
+
+    This is a thin wrapper around `_compute_luminosity_facc_from_dimensionless`
+    that converts CGS inputs to the dimensionless parameters (tau, lum, beta).
 
     Physical Parameters
     -------------------
@@ -212,50 +222,36 @@ def compute_luminosity_facc_from_cgs(
     _validate_choice(mode, "mode", frozenset(("analytic", "tabulated", "mixed")))
     _validate_choice(interpolation, "interpolation", frozenset(("linear", "nearest")))
 
-    # --- 1. Broadcast inputs ----------------------------------------------
+    # --- 1. Broadcast and convert CGS -> dimensionless --------------------
     (mass, shock_efficiency, shock_radius, density,
      temperature, gamma, mu, opacity, other_luminosity) = _broadcast_float(
         mass, shock_efficiency, shock_radius, density,
         temperature, gamma, mu, opacity, other_luminosity,
     )
 
-    # --- 2. Compute quantities --------------------------------------------
-    cs     = _sound_speed(gamma, temperature, mu)
-    rbondi = 0.5 * G_CGS * mass / cs**2
-    tau    = density * opacity * rbondi
-    beta   = _beta(density, cs, gamma, temperature, tau)
-    l0     = 4.0 * np.pi * rbondi**2 * A_RAD_CGS * C_CGS * temperature**4
-    l_acc_ad_dimless = (shock_efficiency * G_CGS * mass
-                        * _adiabatic_mdot(gamma, mass, density, temperature, mu)
-                        / (shock_radius * l0))
-    other_lum_dimless = other_luminosity / l0
-
-    # --- 3. Luminosity root to solve for  ---------------------------------
-    def residual(lum_dimless: np.ndarray) -> np.ndarray:
-        facc = _compute_facc_from_dimensionless(
-            tau, lum_dimless, beta,
-            mode=mode, interpolation=interpolation, extrapolate=extrapolate,
-        )
-        return l_acc_ad_dimless * facc + other_lum_dimless - lum_dimless
-
-    # --- 4. Estimate interval for root [lmin, lmax] -----------------------
-    lmin, lmax = _luminosity_bracket(
-        tau, beta, l_acc_ad_dimless, other_lum_dimless,
-        mode=mode, interpolation=interpolation, max_luminosity=max_luminosity,
+    lum_acc_ad = (shock_efficiency * G_CGS * mass
+                  * _adiabatic_mdot(gamma, mass, density, temperature, mu)
+                  / shock_radius)
+    tau, lum_acc_ad_dimless, beta = _cgs_to_dimensionless(
+        mass, lum_acc_ad, density, temperature, gamma, mu, opacity
     )
+    l0 = _luminosity_scale(_bondi_radius(mass, gamma, temperature, mu), temperature)
+    lum_other_dimless = other_luminosity / l0
 
-    # --- 5. Solve and recover facc ----------------------------------------
-    lum_dimless = _vectorized_bisect(residual, lmin, lmax, atol=atol, rtol=rtol, maxiter=maxiter)
-    facc = _compute_facc_from_dimensionless(
-        tau, lum_dimless, beta,
+    # --- 2. Delegate to dimensionless solver ------------------------------
+    lum_dimless, facc = _compute_luminosity_facc_from_dimensionless(
+        tau, lum_acc_ad_dimless, beta, lum_other_dimless,
         mode=mode, interpolation=interpolation, extrapolate=extrapolate,
+        max_luminosity=max_luminosity, atol=atol, rtol=rtol, maxiter=maxiter,
     )
+
+    # --- 3. Convert back to CGS -------------------------------------------
     lum_out = lum_dimless * l0
     return (lum_out.item(), facc.item()) if lum_out.ndim == 0 else (lum_out, facc)
 
 
 # ---------------------------------------------------------------------------
-# Private - Functions to compute f_acc from dimensionless parameters
+# Private - Functions to compute from dimensionless parameters
 # ---------------------------------------------------------------------------
 def _compute_facc_from_dimensionless(
     tau:           np.ndarray,
@@ -278,15 +274,8 @@ def _compute_facc_from_dimensionless(
         Dimensionless luminosity.
     beta : ndarray
         Dimensionless cooling-time parameter.
-    mode : {"mixed", "analytic", "tabulated"}, keyword-only
-        Method to compute facc; "analytic" applies eq. (B4) of Paper I;
-        "tabulated" interpolates the numerical grid; "mixed" (default)
-        uses analytic for beta <= 1 and tabulated otherwise.
-    interpolation : {"linear", "nearest"}, keyword-only
-        Interpolation scheme used when mode is "tabulated" or "mixed".
-    extrapolate : bool, keyword-only
-        If True, extrapolate outside the tabulated domain [1e-3, 1e3]^3.
-        If False (default), return nan for out-of-domain points.
+    mode, interpolation, extrapolate
+        See `compute_facc_from_cgs` for full descriptions.
 
     Returns
     -------
@@ -314,6 +303,77 @@ def _compute_facc_from_dimensionless(
             )
 
     return f
+
+
+def _compute_luminosity_facc_from_dimensionless(
+    tau:               np.ndarray,
+    lum_acc_ad_dimless: np.ndarray,
+    beta:              np.ndarray,
+    lum_other_dimless: np.ndarray,
+    *,
+    mode:              Mode          = "mixed",
+    interpolation:     Interpolation = "linear",
+    extrapolate:       bool          = False,
+    max_luminosity:    float         = 1e3,
+    atol:              float         = 2e-12,
+    rtol:              float         = np.float64(8.881784197001252e-16),
+    maxiter:           int           = 100,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the self-consistent dimensionless luminosity and f_acc via bisection.
+
+    Solves the fixed-point equation
+
+        L = lum_acc_ad * f_acc(tau, L, beta) + L_other
+
+    entirely in dimensionless units.
+
+    Parameters
+    ----------
+    tau : ndarray
+        Optical depth through the Bondi radius.
+    lum_acc_ad_dimless : ndarray
+        Dimensionless adiabatic accretion luminosity
+    beta : ndarray
+        Dimensionless cooling-time parameter.
+    lum_other_dimless : ndarray
+        Dimensionless luminosity from non-accretion sources.
+    mode, interpolation, extrapolate, max_luminosity, atol, rtol, maxiter
+        Forwarded to `_compute_facc_from_dimensionless` / `_vectorized_bisect`;
+        see `compute_luminosity_facc_from_cgs` for full descriptions.
+
+    Returns
+    -------
+    lum_dimless : ndarray
+        Self-consistent dimensionless luminosity.
+    facc : ndarray
+        Accretion suppression factor f_acc.
+    """
+    tau, lum_acc_ad_dimless, beta, lum_other_dimless = _broadcast_float(
+        tau, lum_acc_ad_dimless, beta, lum_other_dimless
+    )
+
+    # --- 1. Residual: L - (lum_acc_ad * facc + L_other) = 0 ----------------
+    def residual(lum_dimless: np.ndarray) -> np.ndarray:
+        facc = _compute_facc_from_dimensionless(
+            tau, lum_dimless, beta,
+            mode=mode, interpolation=interpolation, extrapolate=extrapolate,
+        )
+        return lum_acc_ad_dimless * facc + lum_other_dimless - lum_dimless
+
+    # --- 2. Bracket the root ----------------------------------------------
+    lmin, lmax = _luminosity_bracket(
+        tau, beta, lum_acc_ad_dimless, lum_other_dimless,
+        mode=mode, interpolation=interpolation, max_luminosity=max_luminosity,
+    )
+
+    # --- 3. Solve and recover facc ----------------------------------------
+    lum_dimless = _vectorized_bisect(residual, lmin, lmax, atol=atol, rtol=rtol, maxiter=maxiter)
+    facc = _compute_facc_from_dimensionless(
+        tau, lum_dimless, beta,
+        mode=mode, interpolation=interpolation, extrapolate=extrapolate,
+    )
+    return lum_dimless, facc
 
 
 def _analytic_facc(tau: np.ndarray, lum: np.ndarray, beta: np.ndarray) -> np.ndarray:
@@ -386,6 +446,7 @@ def _tabulated_facc(
 
     return np.exp(interpolator((np.log(tau), np.log(lum), np.log(beta))))
 
+
 # ---------------------------------------------------------------------------
 # Private - Compute simple physics quantities
 # ---------------------------------------------------------------------------
@@ -407,6 +468,24 @@ def _beta(
             / (gamma * (gamma - 1.0) * A_RAD_CGS * C_CGS * temperature**4 * tau))
 
 
+def _bondi_radius(
+    mass:        np.ndarray,
+    gamma:       np.ndarray,
+    temperature: np.ndarray,
+    mu:          np.ndarray,
+) -> np.ndarray:
+    """Bondi radius [cm]."""
+    return 0.5 * G_CGS * mass / _sound_speed(gamma, temperature, mu)**2
+
+
+def _luminosity_scale(
+    rbondi:      np.ndarray,
+    temperature: np.ndarray,
+) -> np.ndarray:
+    """Luminosity scale l0 used to non-dimensionalise luminosity [erg s^-1]."""
+    return 4.0 * np.pi * rbondi**2 * A_RAD_CGS * C_CGS * temperature**4
+
+
 def _cgs_to_dimensionless(
     mass:        np.ndarray,
     luminosity:  np.ndarray,
@@ -418,34 +497,34 @@ def _cgs_to_dimensionless(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (tau, lum_dimless, beta) from CGS physical parameters."""
     cs     = _sound_speed(gamma, temperature, mu)
-    rbondi = 0.5 * G_CGS * mass / cs**2
+    rbondi = _bondi_radius(mass, gamma, temperature, mu)
     tau    = density * opacity * rbondi
-    lum    = luminosity / (4.0 * np.pi * rbondi**2 * A_RAD_CGS * C_CGS * temperature**4)
+    lum    = luminosity / _luminosity_scale(rbondi, temperature)
     beta   = _beta(density, cs, gamma, temperature, tau)
     return tau, lum, beta
 
 
 def _adiabatic_mdot(
-    gamma: np.ndarray,
-    mass:  np.ndarray,
-    rho:   np.ndarray,
-    temp:  np.ndarray,
-    mu:    np.ndarray,
+    gamma:       np.ndarray,
+    mass:        np.ndarray,
+    density:     np.ndarray,
+    temperature: np.ndarray,
+    mu:          np.ndarray,
 ) -> np.ndarray:
     """
     Adiabatic Bondi accretion rate [g s^-1].
 
     Parameters
     ----------
-    gamma : array-like  Ratio of specific heats.
-    mass  : array-like  Accretor mass [g].
-    rho   : array-like  Ambient density [g cm^-3].
-    temp  : array-like  Ambient temperature [K].
-    mu    : array-like  Mean molecular weight [proton masses].
+    gamma       : array-like  Ratio of specific heats.
+    mass        : array-like  Accretor mass [g].
+    density     : array-like  Ambient density [g cm^-3].
+    temperature : array-like  Ambient temperature [K].
+    mu          : array-like  Mean molecular weight [proton masses].
     """
     q  = (2.0 / (5.0 - 3.0 * gamma)) ** ((5.0 - 3.0 * gamma) / (2.0 * gamma - 2.0))
-    cs = _sound_speed(gamma, temp, mu)
-    return q * np.pi * G_CGS**2 * mass**2 * rho / cs**3
+    cs = _sound_speed(gamma, temperature, mu)
+    return q * np.pi * G_CGS**2 * mass**2 * density / cs**3
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +534,8 @@ def _adiabatic_mdot(
 def _luminosity_bracket(
     tau:              np.ndarray,
     beta:             np.ndarray,
-    l_acc_ad_dimless: np.ndarray,
-    other_lum_dimless: np.ndarray,
+    lum_acc_ad_dimless: np.ndarray,
+    lum_other_dimless: np.ndarray,
     *,
     mode:             Mode,
     interpolation:    Interpolation,
@@ -471,13 +550,16 @@ def _luminosity_bracket(
         Estimated from the optically-thin regime for analytic. 
         Set by max_luminosity for tabulated.
     """
+    if max_luminosity < 1e3:
+        raise ValueError(f"max_luminosity must be >= 1e3, got {max_luminosity!r}")
+
     # --- analytic lower bound ---------------------------------------------
     lmin = np.asarray(np.minimum(np.minimum(A3, A2 / tau), A1 * tau * beta) * (1.0 + _SMALL))
 
     # --- analytic upper bound from thin-regime ----------------------------
     thin_lmin = np.maximum(A3, tau * A3**2 / A2)
     # if L > thin_lmin, then L = a*L^{-5/4} + b < a*(thin_lmin)^{-5/4} + b
-    lmax = np.asarray(l_acc_ad_dimless * (thin_lmin / A3) ** (-1.25) + other_lum_dimless)
+    lmax = np.asarray(lum_acc_ad_dimless * (thin_lmin / A3) ** (-1.25) + lum_other_dimless)
     # fall back where no thin solution exists
     no_thin = lmax <= thin_lmin
     lmax[no_thin] = thin_lmin[no_thin]
